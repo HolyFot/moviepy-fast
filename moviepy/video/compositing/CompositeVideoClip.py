@@ -2,7 +2,9 @@
 
 from functools import reduce
 
+import cv2
 import numpy as np
+from PIL import Image
 
 from moviepy.audio.AudioClip import CompositeAudioClip
 from moviepy.video.VideoClip import ColorClip, VideoClip
@@ -49,29 +51,12 @@ class CompositeVideoClip(VideoClip):
       have the same size as the final clip. If it has no transparency, the final
       clip will have no mask.
 
-    is_mask
-      Set to True if the composite clip is a mask.
-
-    memoize_mask
-        Set to True if the mask of the composite clip should be memoized during
-        frame generation. This is useful for performances in speed with the trafe-off
-        beeing a larger memory usage. If set to False, the mask will be
-        recomputed at each frame generation. Default is True.
-
-
-
     The clip with the highest FPS will be the FPS of the composite clip.
 
     """
 
     def __init__(
-        self,
-        clips,
-        size=None,
-        bg_color=(0, 0, 0),
-        use_bgclip=False,
-        is_mask=False,
-        memoize_mask=True,
+        self, clips, size=None, bg_color=None, use_bgclip=False, is_mask=False
     ):
         if size is None:
             size = clips[0].size
@@ -99,7 +84,6 @@ class CompositeVideoClip(VideoClip):
         self.is_mask = is_mask
         self.clips = clips
         self.bg_color = bg_color
-        self.memoize_mask = memoize_mask
 
         # Use first clip as background if necessary, else use color
         # either set by user or previously generated
@@ -142,71 +126,252 @@ class CompositeVideoClip(VideoClip):
                 maskclips = [self.bg.mask] + maskclips
 
             self.mask = CompositeVideoClip(
-                maskclips,
-                self.size,
-                is_mask=True,
-                bg_color=0.0,
-                memoize_mask=memoize_mask,
+                maskclips, self.size, is_mask=True, bg_color=0.0
             )
 
-        if self.memoize_mask and self.is_mask:
-            # Memoize the mask to speed up frame generation
-            self.precomputed = {}
+        # Pre-compute compositing optimizations
+        self._cached_frame = None
+        self._clip_blit_pil = {}
+        self._clip_blit_np = {}
+        self._any_masks = any(c.mask is not None for c in self.clips)
+        if not is_mask:
+            self._precompute_compositing()
+
+    def _precompute_compositing(self):
+        """Pre-compute blit data for static clips and cache fully static frames."""
+        full_w, full_h = self.size
+        all_static = True
+        all_always_playing = True
+
+        for i, clip in enumerate(self.clips):
+            src_pil = getattr(clip, '_cached_pil', None)
+            has_mask = clip.mask is not None
+            mask_pil = (getattr(clip.mask, '_cached_pil', None)
+                        if has_mask else None)
+
+            if src_pil is None or (has_mask and mask_pil is None):
+                all_static = False
+                continue
+
+            # Check constant position
+            if clip.pos(0) != clip.pos(1.0):
+                all_static = False
+                continue
+
+            # Resolve position via new_blit_on (handles string positions)
+            result = clip.new_blit_on(clip.start, full_w, full_h)
+            if result is None:
+                continue
+            _, pos, _, _ = result
+            x, y = pos
+            cw_px, ch_px = src_pil.size  # PIL size is (w, h)
+
+            if x <= -cw_px or x >= full_w or y <= -ch_px or y >= full_h:
+                continue
+
+            src_x1, src_y1 = max(0, -x), max(0, -y)
+            src_x2 = min(cw_px, full_w - x)
+            src_y2 = min(ch_px, full_h - y)
+            dst_x1, dst_y1 = max(0, x), max(0, y)
+
+            if src_x2 <= src_x1 or src_y2 <= src_y1:
+                continue
+
+            no_crop = (src_x1 == 0 and src_y1 == 0
+                       and src_x2 == cw_px and src_y2 == ch_px)
+
+            # Pre-compute PIL blit data
+            sp = src_pil if no_crop else src_pil.crop((src_x1, src_y1, src_x2, src_y2))
+            mp = None
+            if mask_pil is not None:
+                mp = mask_pil if no_crop else mask_pil.crop(
+                    (src_x1, src_y1, src_x2, src_y2))
+            self._clip_blit_pil[i] = (sp, mp, dst_x1, dst_y1, has_mask)
+
+            # Pre-compute numpy blit data
+            cached = clip._cached_uint8
+            if cached is not None:
+                dst_x2 = dst_x1 + (src_x2 - src_x1)
+                dst_y2 = dst_y1 + (src_y2 - src_y1)
+                src_slice = cached[src_y1:src_y2, src_x1:src_x2]
+                if src_slice.ndim == 2:
+                    src_slice = cv2.cvtColor(src_slice, cv2.COLOR_GRAY2RGB)
+                elif src_slice.ndim == 3 and src_slice.shape[2] == 4:
+                    src_slice = src_slice[:, :, :3]
+                self._clip_blit_np[i] = (src_slice, dst_y1, dst_y2, dst_x1, dst_x2)
+
+            # Check always playing
+            if clip.start != 0:
+                all_always_playing = False
+            elif (self.duration is not None and clip.end is not None
+                  and clip.end < self.duration):
+                all_always_playing = False
+
+        # Fully static + always playing → pre-render one frame
+        if all_static and all_always_playing and self._clip_blit_pil:
+            bg_pil = getattr(self.bg, '_cached_pil', None)
+            if bg_pil is not None and bg_pil.size == (full_w, full_h):
+                canvas = bg_pil.copy()
+            else:
+                canvas = Image.fromarray(
+                    self._make_numpy_canvas(0, full_w, full_h), mode='RGB'
+                )
+            for i in sorted(self._clip_blit_pil):
+                sp, mp, dx, dy, has_mask = self._clip_blit_pil[i]
+                if has_mask and mp is not None:
+                    canvas.paste(sp, (dx, dy), mp)
+                else:
+                    canvas.paste(sp, (dx, dy))
+            self._cached_frame = np.asarray(canvas).copy()
 
     def frame_function(self, t):
         """The clips playing at time `t` are blitted over one another."""
-        # For the mask we recalculate the final transparency we'll need
-        # to apply on the result image
-        if self.is_mask:
-            if (
-                self.memoize_mask
-                and t in self.precomputed
-                and self.precomputed[t] is not None
-            ):
-                mask = self.precomputed[t].copy()
-                del self.precomputed[t]  # Free memory as soon as possible
-                return mask
+        full_w, full_h = self.size
 
-            mask = np.zeros((self.size[1], self.size[0]), dtype=float)
+        # Mask compositing path — pure numpy
+        if self.is_mask:
+            mask = np.zeros((full_h, full_w), dtype=np.float32)
             for clip in self.playing_clips(t):
                 mask = clip.compose_mask(mask, t)
-
             return mask
 
-        # Clip merging in pure numpy
-        bg_t = t - self.bg.start
-        bg_frame = self.bg.get_frame(bg_t).astype("uint8")
-        clip_height, clip_width = bg_frame.shape[:2]
+        # Fully static composition → return pre-rendered frame
+        if self._cached_frame is not None:
+            return self._cached_frame
 
-        if self.bg.mask:
-            bgm_t = t - self.bg.mask.start
-            bg_mask = self.bg.mask.get_frame(bgm_t)
+        if self._any_masks:
+            return self._frame_pil_canvas(t, full_w, full_h)
+        else:
+            return self._frame_numpy(t, full_w, full_h)
 
-            # Resize bg_mask to match bg_frame, always use top left corner
-            if bg_frame.shape[:2] != bg_mask.shape[:2]:
-                mask_height, mask_width = bg_mask.shape[:2]
+    def _make_numpy_canvas(self, t, full_w, full_h):
+        """Build a writable uint8 RGB numpy canvas from the background."""
+        bg = self.bg.get_frame_uint8(t - self.bg.start)
+        if bg.ndim == 2:
+            bg = cv2.cvtColor(bg, cv2.COLOR_GRAY2RGB)
+        elif bg.shape[2] == 4:
+            bg = bg[:, :, :3]
+        if bg.shape[0] >= full_h and bg.shape[1] >= full_w:
+            return bg[:full_h, :full_w].copy()
+        current = np.zeros((full_h, full_w, 3), dtype=np.uint8)
+        bh, bw = bg.shape[:2]
+        current[:min(bh, full_h), :min(bw, full_w)] = \
+            bg[:min(bh, full_h), :min(bw, full_w)]
+        return current
 
-                # If mask is larger, crop it
-                if mask_width > clip_width or mask_height > clip_height:
-                    bg_mask = bg_mask[:clip_height, :clip_width]
-
-                # If mask is smaller, fill it with zeros
-                if mask_width < clip_width or mask_height < clip_height:
-                    new_mask = np.zeros((clip_height, clip_width), dtype=bg_mask.dtype)
-                    new_mask[:mask_height, :mask_width] = bg_mask
-                    bg_mask = new_mask
-
-        # For each clip apply on top of current img
-        current_frame = bg_frame
-        current_mask = bg_mask if self.bg.mask else None
-        for clip in self.playing_clips(t):
-            current_frame, current_mask = clip.compose_on(
-                current_frame, t, current_mask
+    def _frame_pil_canvas(self, t, full_w, full_h):
+        """Compositing via a single PIL canvas with pre-computed blit data."""
+        bg_pil = getattr(self.bg, '_cached_pil', None)
+        if bg_pil is not None and bg_pil.size == (full_w, full_h):
+            canvas = bg_pil.copy()
+        else:
+            canvas = Image.fromarray(
+                self._make_numpy_canvas(t, full_w, full_h), mode='RGB'
             )
-            if self.mask and self.memoize_mask:
-                self.mask.precomputed[t] = current_mask
 
-        return current_frame
+        blit_cache = self._clip_blit_pil
+
+        for i, clip in enumerate(self.clips):
+            # Inline is_playing — skip decorator overhead
+            if not (clip.start <= t and (clip.end is None or t < clip.end)):
+                continue
+
+            blit = blit_cache.get(i)
+            if blit is not None:
+                # Fast path: pre-computed PIL data
+                sp, mp, dx, dy, has_mask = blit
+                if has_mask and mp is not None:
+                    canvas.paste(sp, (dx, dy), mp)
+                else:
+                    canvas.paste(sp, (dx, dy))
+            else:
+                # Fallback for dynamic clips
+                result = clip.new_blit_on(t, full_w, full_h)
+                if result is None:
+                    continue
+                img, pos, clip_mask, _ = result
+                if img is None:
+                    continue
+
+                clip_h, clip_w = img.shape[:2]
+                x, y = pos
+                if x <= -clip_w or x >= full_w or y <= -clip_h or y >= full_h:
+                    continue
+
+                src_x1, src_y1 = max(0, -x), max(0, -y)
+                src_x2 = min(clip_w, full_w - x)
+                src_y2 = min(clip_h, full_h - y)
+                dst_x1, dst_y1 = max(0, x), max(0, y)
+
+                if src_x2 <= src_x1 or src_y2 <= src_y1:
+                    continue
+
+                src_arr = img[src_y1:src_y2, src_x1:src_x2]
+                if src_arr.ndim == 2:
+                    src_arr = cv2.cvtColor(src_arr, cv2.COLOR_GRAY2RGB)
+                elif src_arr.shape[2] == 4:
+                    src_arr = src_arr[:, :, :3]
+
+                sp = Image.fromarray(src_arr, mode='RGB')
+                if clip_mask is not None:
+                    mask_s = clip_mask[src_y1:src_y2, src_x1:src_x2]
+                    if mask_s.ndim == 3:
+                        mask_s = mask_s[:, :, 0]
+                    mp = Image.fromarray(mask_s, mode='L')
+                    canvas.paste(sp, (dst_x1, dst_y1), mp)
+                else:
+                    canvas.paste(sp, (dst_x1, dst_y1))
+
+        return np.asarray(canvas)
+
+    def _frame_numpy(self, t, full_w, full_h):
+        """Pure numpy compositing — fastest for clips without masks."""
+        current = self._make_numpy_canvas(t, full_w, full_h)
+
+        np_cache = self._clip_blit_np
+
+        for i, clip in enumerate(self.clips):
+            # Inline is_playing — skip decorator overhead
+            if not (clip.start <= t and (clip.end is None or t < clip.end)):
+                continue
+
+            np_data = np_cache.get(i)
+            if np_data is not None:
+                # Fast path: pre-computed numpy slices
+                src, dy1, dy2, dx1, dx2 = np_data
+                current[dy1:dy2, dx1:dx2] = src
+            else:
+                # Fallback for dynamic clips
+                result = clip.new_blit_on(t, full_w, full_h)
+                if result is None:
+                    continue
+                img, pos, clip_mask, _ = result
+                if img is None:
+                    continue
+
+                clip_h, clip_w = img.shape[:2]
+                x, y = pos
+                if x <= -clip_w or x >= full_w or y <= -clip_h or y >= full_h:
+                    continue
+
+                src_x1, src_y1 = max(0, -x), max(0, -y)
+                src_x2 = min(clip_w, full_w - x)
+                src_y2 = min(clip_h, full_h - y)
+                dst_x1, dst_y1 = max(0, x), max(0, y)
+                dst_x2 = dst_x1 + (src_x2 - src_x1)
+                dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+                if src_x2 <= src_x1 or src_y2 <= src_y1:
+                    continue
+
+                src = img[src_y1:src_y2, src_x1:src_x2]
+                if src.ndim == 2:
+                    src = cv2.cvtColor(src, cv2.COLOR_GRAY2RGB)
+                elif src.shape[2] == 4:
+                    src = src[:, :, :3]
+                current[dst_y1:dst_y2, dst_x1:dst_x2] = src
+
+        return current
 
     def playing_clips(self, t=0):
         """Returns a list of the clips in the composite clips that are
