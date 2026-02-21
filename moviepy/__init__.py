@@ -23,13 +23,6 @@ from moviepy.video.io import ffmpeg_tools
 from moviepy.video.io.display_in_notebook import display_in_notebook
 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 from moviepy.video.io.VideoFileClip import VideoFileClip
-from moviepy.video.FancyText import (
-    create_static_fancytext,
-    create_text_overlay,
-    create_word_fancytext,
-    create_word_fancytext_adv,
-    generate_procedural_texture,
-)
 from moviepy.video.VideoClip import (
     BitmapClip,
     ColorClip,
@@ -72,9 +65,4 @@ __all__ = [
     "videotools",
     "ffmpeg_tools",
     "convert_to_seconds",
-    "create_word_fancytext",
-    "create_word_fancytext_adv",
-    "create_static_fancytext",
-    "create_text_overlay",
-    "generate_procedural_texture",
 ]
